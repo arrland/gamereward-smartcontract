@@ -18,15 +18,7 @@ async function main() {
   } else {
     gameTokenAddress = "0x14e5386f47466a463f85d151653e1736c0c50fc3";
     adminAddress = "0x0cEc288905316197bA3BBf2F19D94286d684fe43";
-    batchAddress = "0x0cEc288905316197bA3BBf2F19D94286d684fe43";
-  }
-
-
-  if (!gameTokenAddress) {
-    throw new Error("GAME_TOKEN_ADDRESS not set in environment variables");
-  }
-  if (!adminAddress) {
-    throw new Error("ADMIN_ADDRESS not set in environment variables");
+    batchAddress = "0xb8Dc88Adb664a4A398799fE7bDaF79871771B293";
   }
 
   // Deploy the contract

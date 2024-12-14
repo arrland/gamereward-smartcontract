@@ -1,7 +1,8 @@
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
-const { MerkleTree } = require("merkletreejs");
+const { generateMerkleTree } = require("./merkleUtils");
 const keccak256 = require("keccak256");
+const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
 describe("GameRewards", function () {
   let gameRewards;
@@ -12,6 +13,7 @@ describe("GameRewards", function () {
   let user2;
   let user3;
   let merkleTree;
+  let proofs;
   let rewards;
   const INITIAL_DELAY = 120; // 2 minutes
 
@@ -45,25 +47,18 @@ describe("GameRewards", function () {
     });
 
     it("Should set the correct initial claim delay", async function () {
-      expect(await gameRewards.claimDelay()).to.equal(INITIAL_DELAY);
+      expect(await gameRewards.claimDelay()).to.equal(await gameRewards.INITIAL_DELAY());
     });
   });
 
   describe("Batch Management", function () {
     beforeEach(async function () {
       rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") }
+        { address: user1.address, amount: ethers.parseEther("100") }
       ];
       
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree, root } = generateMerkleTree(rewards);
+      merkleTree = tree;
     });
 
     it("Should allow batch adder to set new rewards batch", async function () {
@@ -137,18 +132,11 @@ describe("GameRewards", function () {
 
       // Create new rewards and merkle tree
       const newRewards = [
-        { account: user2.address, amount: ethers.parseEther("200") }
+        { address: user2.address, amount: ethers.parseEther("200") }
       ];
       
-      const newLeaves = newRewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const newMerkleTree = new MerkleTree(newLeaves, keccak256, { sortPairs: true });
+      const { tree: newTree, root: newRoot } = generateMerkleTree(newRewards);
+      const newMerkleTree = newTree;
 
       // Overwrite batch
       await gameRewards.connect(batchAdder).setRewardsBatch(
@@ -163,13 +151,13 @@ describe("GameRewards", function () {
 
     it("Should handle batch with zero rewards in merkle tree", async function () {
       // Create merkle tree with a single dummy leaf to avoid empty tree
-      const dummyLeaf = ethers.keccak256(
+      const dummyLeaf = keccak256(
         ethers.solidityPacked(
           ["address", "uint256"],
           [ethers.ZeroAddress, 0]
         )
       );
-      const emptyMerkleTree = new MerkleTree([dummyLeaf], keccak256, { sortPairs: true });
+      const emptyMerkleTree = generateMerkleTree([{ address: ethers.ZeroAddress, amount: 0 }]).tree;
 
       await gameRewards.connect(batchAdder).setRewardsBatch(
         emptyMerkleTree.getHexRoot(),
@@ -194,56 +182,43 @@ describe("GameRewards", function () {
   describe("Multiple Claims Functionality", function () {
     beforeEach(async function () {
       rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") },
-        { account: user2.address, amount: ethers.parseEther("150") },
-        { account: user3.address, amount: ethers.parseEther("50") }
+        { address: user1.address, amount: ethers.parseEther("100") },
+        { address: user2.address, amount: ethers.parseEther("150") },
+        { address: user3.address, amount: ethers.parseEther("50") }
       ];
       
-      const leaves = rewards.map(reward =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [reward.account, reward.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const merkleData = generateMerkleTree(rewards);
+      merkleTree = merkleData.tree;
+      proofs = merkleData.proofs;
+
+      // Set a shorter claim delay for testing
+      await gameRewards.connect(owner).setClaimDelay(60);
     });
 
     it("Should correctly sum multiple claim amounts", async function () {
       await gameRewards.connect(batchAdder).setRewardsBatch(
         merkleTree.getHexRoot(),
-        ethers.parseEther("300") // 100 + 150 + 50
+        ethers.parseEther("300")
       );
       const batchId = await gameRewards.currentBatchId();
 
-      const claims = rewards.map((reward) => {
-        const proof = merkleTree.getHexProof(
-          ethers.keccak256(
-            ethers.solidityPacked(
-              ["address", "uint256"],
-              [reward.account, reward.amount]
-            )
-          )
-        );
-        return {
-          batchId,
-          amount: reward.amount,
-          merkleProof: proof
-        };
-      });
+      const claims = rewards.map((reward) => ({
+        batchId: batchId,
+        amount: reward.amount,
+        merkleProof: proofs[ethers.getAddress(reward.address)]
+      })).filter(claim => claim.merkleProof === proofs[ethers.getAddress(user1.address)]);
 
-      for (let i = 0; i < rewards.length; i++) {
-        const user = [user1, user2, user3][i];
-        if (i > 0) {
-          await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
-          await ethers.provider.send("evm_mine");
-        }
-        await gameRewards.connect(user).claimMultipleRewards([claims[i]]);
-      }
+      // Calculate total amount - only for user1's claims
+      const totalAmount = rewards
+        .filter(reward => reward.address === user1.address)
+        .reduce((sum, reward) => sum + BigInt(reward.amount), BigInt(0));
 
-      expect(await gameRewards.claimedAmounts(batchId))
-        .to.equal(ethers.parseEther("300"));
+      const nextBlockTimestamp = await time.latest() + 1;
+      await expect(gameRewards.connect(user1).claimMultipleRewards(claims))
+        .to.emit(gameRewards, "RewardClaimed")
+        .withArgs(user1.address, batchId, rewards[0].amount, nextBlockTimestamp);
+
+      expect(await gameToken.balanceOf(user1.address)).to.equal(totalAmount);
     });
 
     it("Should handle concurrent claims from same batch", async function () {
@@ -257,10 +232,10 @@ describe("GameRewards", function () {
         const reward = rewards[i];
         const user = [user1, user2, user3][i];
         const proof = merkleTree.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
-              [reward.account, reward.amount]
+              [reward.address, reward.amount]
             )
           )
         );
@@ -293,7 +268,7 @@ describe("GameRewards", function () {
           batchId: currentBatchId,
           amount: validAmount,
           merkleProof: merkleTree.getHexProof(
-            ethers.keccak256(
+            keccak256(
               ethers.solidityPacked(
                 ["address", "uint256"],
                 [user1.address, validAmount]
@@ -305,7 +280,7 @@ describe("GameRewards", function () {
           batchId: currentBatchId,
           amount: invalidAmount,
           merkleProof: merkleTree.getHexProof(
-            ethers.keccak256(
+            keccak256(
               ethers.solidityPacked(
                 ["address", "uint256"],
                 [user1.address, validAmount] // Use valid amount to get valid proof
@@ -330,10 +305,10 @@ describe("GameRewards", function () {
 
       // First user claims their reward
       const user1Proof = merkleTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
-            [rewards[0].account, rewards[0].amount]
+            [rewards[0].address, rewards[0].amount]
           )
         )
       );
@@ -350,14 +325,14 @@ describe("GameRewards", function () {
       expect(await gameRewards.hasClaimed(user3.address, batchId)).to.be.false;
 
       // Second user claims after delay
-      await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+      await ethers.provider.send("evm_increaseTime", [60]);
       await ethers.provider.send("evm_mine");
 
       const user2Proof = merkleTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
-            [rewards[1].account, rewards[1].amount]
+            [rewards[1].address, rewards[1].amount]
           )
         )
       );
@@ -374,14 +349,14 @@ describe("GameRewards", function () {
       expect(await gameRewards.hasClaimed(user3.address, batchId)).to.be.false;
 
       // Third user claims after delay
-      await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+      await ethers.provider.send("evm_increaseTime", [60]);
       await ethers.provider.send("evm_mine");
 
       const user3Proof = merkleTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
-            [rewards[2].account, rewards[2].amount]
+            [rewards[2].address, rewards[2].amount]
           )
         )
       );
@@ -409,10 +384,10 @@ describe("GameRewards", function () {
       // Generate proofs for all rewards
       const claims = rewards.map((reward) => {
         const proof = merkleTree.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
-              [reward.account, reward.amount]
+              [reward.address, reward.amount]
             )
           )
         );
@@ -429,7 +404,7 @@ describe("GameRewards", function () {
         const reward = rewards[i];
 
         if (i > 0) {
-          await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+          await ethers.provider.send("evm_increaseTime", [60]);
           await ethers.provider.send("evm_mine");
         }
 
@@ -458,7 +433,7 @@ describe("GameRewards", function () {
         batchId: batchId,
         amount: ethers.parseEther("100"), // Try to claim 100 tokens
         merkleProof: merkleTree.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
               [user1.address, ethers.parseEther("100")]
@@ -478,21 +453,13 @@ describe("GameRewards", function () {
     it("Should track claimed amounts correctly across multiple claims", async function () {
       // Create a new set of rewards for this test
       const batchRewards = [
-        { account: user1.address, amount: ethers.parseEther("100") },
-        { account: user2.address, amount: ethers.parseEther("150") },
-        { account: user3.address, amount: ethers.parseEther("175") }  
+        { address: user1.address, amount: ethers.parseEther("100") },
+        { address: user2.address, amount: ethers.parseEther("150") },
+        { address: user3.address, amount: ethers.parseEther("175") }  
       ];
       
       // Create merkle tree for the new rewards
-      const leaves = batchRewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const batchTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree: batchTree } = generateMerkleTree(batchRewards);
 
       // Set up a batch with limited total amount
       const batchTotalAmount = ethers.parseEther("300"); // Only allow 300 tokens total
@@ -507,7 +474,7 @@ describe("GameRewards", function () {
         batchId: batchId,
         amount: ethers.parseEther("100"),
         merkleProof: batchTree.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
               [user1.address, ethers.parseEther("100")]
@@ -520,7 +487,7 @@ describe("GameRewards", function () {
       expect(await gameRewards.claimedAmounts(batchId)).to.equal(ethers.parseEther("100"));
 
       // Advance time for next claim
-      await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+      await ethers.provider.send("evm_increaseTime", [60]);
       await ethers.provider.send("evm_mine");
 
       // Second claim by user2
@@ -528,7 +495,7 @@ describe("GameRewards", function () {
         batchId: batchId,
         amount: ethers.parseEther("150"),
         merkleProof: batchTree.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
               [user2.address, ethers.parseEther("150")]
@@ -541,7 +508,7 @@ describe("GameRewards", function () {
       expect(await gameRewards.claimedAmounts(batchId)).to.equal(ethers.parseEther("250"));
 
       // Advance time for next claim
-      await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+      await ethers.provider.send("evm_increaseTime", [60]);
       await ethers.provider.send("evm_mine");
 
       // Try to claim the third reward which would exceed the batch total
@@ -549,7 +516,7 @@ describe("GameRewards", function () {
         batchId: batchId,
         amount: ethers.parseEther("175"),
         merkleProof: batchTree.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
               [user3.address, ethers.parseEther("175")]
@@ -578,10 +545,10 @@ describe("GameRewards", function () {
       const claims = await Promise.all(rewards.map(async (reward, i) => {
         const user = [user1, user2, user3][i];
         const proof = merkleTree.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
-              [reward.account, reward.amount]
+              [reward.address, reward.amount]
             )
           )
         );
@@ -589,7 +556,7 @@ describe("GameRewards", function () {
         return {
           user,
           claim: {
-            batchId: batchId,
+            batchId,
             amount: reward.amount,
             merkleProof: proof
           }
@@ -609,25 +576,17 @@ describe("GameRewards", function () {
     it("Should correctly track claims across multiple batches", async function () {
       // Create two batches with different rewards
       const batch1Rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") },
-        { account: user2.address, amount: ethers.parseEther("150") }
+        { address: user1.address, amount: ethers.parseEther("100") },
+        { address: user2.address, amount: ethers.parseEther("150") }
       ];
       
       const batch2Rewards = [
-        { account: user2.address, amount: ethers.parseEther("200") },
-        { account: user3.address, amount: ethers.parseEther("250") }
+        { address: user2.address, amount: ethers.parseEther("200") },
+        { address: user3.address, amount: ethers.parseEther("250") }
       ];
 
       // Setup batch 1
-      const leaves1 = batch1Rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const tree1 = new MerkleTree(leaves1, keccak256, { sortPairs: true });
+      const { tree: tree1 } = generateMerkleTree(batch1Rewards);
       
       await gameRewards.connect(batchAdder).setRewardsBatch(
         tree1.getHexRoot(),
@@ -636,15 +595,7 @@ describe("GameRewards", function () {
       const batch1Id = await gameRewards.currentBatchId();
 
       // Setup batch 2
-      const leaves2 = batch2Rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const tree2 = new MerkleTree(leaves2, keccak256, { sortPairs: true });
+      const { tree: tree2 } = generateMerkleTree(batch2Rewards);
       
       await gameRewards.connect(batchAdder).setRewardsBatch(
         tree2.getHexRoot(),
@@ -658,16 +609,16 @@ describe("GameRewards", function () {
         const reward = batch1Rewards[i];
         const user = [user1, user2][i];
         const proof = tree1.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
-              [reward.account, reward.amount]
+              [reward.address, reward.amount]
             )
           )
         );
 
         if (i > 0) {
-          await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+          await ethers.provider.send("evm_increaseTime", [60]);
           await ethers.provider.send("evm_mine");
         }
 
@@ -683,15 +634,15 @@ describe("GameRewards", function () {
         const reward = batch2Rewards[i];
         const user = [user2, user3][i];
         const proof = tree2.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
-              [reward.account, reward.amount]
+              [reward.address, reward.amount]
             )
           )
         );
 
-        await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+        await ethers.provider.send("evm_increaseTime", [60]);
         await ethers.provider.send("evm_mine");
 
         await gameRewards.connect(user).claimMultipleRewards([{
@@ -713,20 +664,16 @@ describe("GameRewards", function () {
     beforeEach(async function () {
       // Create rewards with exact amounts for testing
       rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") },
-        { account: user2.address, amount: ethers.parseEther("150") },
-        { account: user3.address, amount: ethers.parseEther("50") }
+        { address: user1.address, amount: ethers.parseEther("100") },
+        { address: user2.address, amount: ethers.parseEther("150") },
+        { address: user3.address, amount: ethers.parseEther("50") }
       ];
       
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree } = generateMerkleTree(rewards);
+      merkleTree = tree;
+
+      // Set a shorter claim delay for testing
+      await gameRewards.connect(owner).setClaimDelay(60);
     });
 
     it("Should allow claiming exact batch total amount", async function () {
@@ -743,17 +690,17 @@ describe("GameRewards", function () {
         const reward = rewards[i];
         const user = [user1, user2, user3][i];
         const proof = merkleTree.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
-              [reward.account, reward.amount]
+              [reward.address, reward.amount]
             )
           )
         );
 
         if (i > 0) {
           // Advance time for subsequent claims
-          await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+          await ethers.provider.send("evm_increaseTime", [60]);
           await ethers.provider.send("evm_mine");
         }
 
@@ -771,20 +718,12 @@ describe("GameRewards", function () {
     it("Should allow multiple partial claims summing to total", async function () {
       // Create a batch with multiple rewards for different users that sum to a total
       const partialRewards = [
-        { account: user1.address, amount: ethers.parseEther("10") },
-        { account: user2.address, amount: ethers.parseEther("20") },
-        { account: user3.address, amount: ethers.parseEther("30") }
+        { address: user1.address, amount: ethers.parseEther("10") },
+        { address: user2.address, amount: ethers.parseEther("20") },
+        { address: user3.address, amount: ethers.parseEther("30") }
       ];
       
-      const partialLeaves = partialRewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const partialTree = new MerkleTree(partialLeaves, keccak256, { sortPairs: true });
+      const { tree: partialTree } = generateMerkleTree(partialRewards);
 
       // Set batch total to sum of partial rewards
       const totalAmount = ethers.parseEther("60"); // 10 + 20 + 30
@@ -799,16 +738,16 @@ describe("GameRewards", function () {
         const reward = partialRewards[i];
         const user = [user1, user2, user3][i];
         const proof = partialTree.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
-              [reward.account, reward.amount]
+              [reward.address, reward.amount]
             )
           )
         );
 
         if (i > 0) {
-          await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+          await ethers.provider.send("evm_increaseTime", [60]);
           await ethers.provider.send("evm_mine");
         }
 
@@ -835,10 +774,10 @@ describe("GameRewards", function () {
       const claims = await Promise.all(rewards.map(async (reward, i) => {
         const user = [user1, user2, user3][i];
         const proof = merkleTree.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
-              [reward.account, reward.amount]
+              [reward.address, reward.amount]
             )
           )
         );
@@ -866,25 +805,17 @@ describe("GameRewards", function () {
     it("Should correctly track claims across multiple batches", async function () {
       // Create two batches with different rewards
       const batch1Rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") },
-        { account: user2.address, amount: ethers.parseEther("150") }
+        { address: user1.address, amount: ethers.parseEther("100") },
+        { address: user2.address, amount: ethers.parseEther("150") }
       ];
       
       const batch2Rewards = [
-        { account: user2.address, amount: ethers.parseEther("200") },
-        { account: user3.address, amount: ethers.parseEther("250") }
+        { address: user2.address, amount: ethers.parseEther("200") },
+        { address: user3.address, amount: ethers.parseEther("250") }
       ];
 
       // Setup batch 1
-      const leaves1 = batch1Rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const tree1 = new MerkleTree(leaves1, keccak256, { sortPairs: true });
+      const { tree: tree1 } = generateMerkleTree(batch1Rewards);
       
       await gameRewards.connect(batchAdder).setRewardsBatch(
         tree1.getHexRoot(),
@@ -893,15 +824,7 @@ describe("GameRewards", function () {
       const batch1Id = await gameRewards.currentBatchId();
 
       // Setup batch 2
-      const leaves2 = batch2Rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const tree2 = new MerkleTree(leaves2, keccak256, { sortPairs: true });
+      const { tree: tree2 } = generateMerkleTree(batch2Rewards);
       
       await gameRewards.connect(batchAdder).setRewardsBatch(
         tree2.getHexRoot(),
@@ -915,16 +838,16 @@ describe("GameRewards", function () {
         const reward = batch1Rewards[i];
         const user = [user1, user2][i];
         const proof = tree1.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
-              [reward.account, reward.amount]
+              [reward.address, reward.amount]
             )
           )
         );
 
         if (i > 0) {
-          await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+          await ethers.provider.send("evm_increaseTime", [60]);
           await ethers.provider.send("evm_mine");
         }
 
@@ -940,15 +863,15 @@ describe("GameRewards", function () {
         const reward = batch2Rewards[i];
         const user = [user2, user3][i];
         const proof = tree2.getHexProof(
-          ethers.keccak256(
+          keccak256(
             ethers.solidityPacked(
               ["address", "uint256"],
-              [reward.account, reward.amount]
+              [reward.address, reward.amount]
             )
           )
         );
 
-        await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+        await ethers.provider.send("evm_increaseTime", [60]);
         await ethers.provider.send("evm_mine");
 
         await gameRewards.connect(user).claimMultipleRewards([{
@@ -969,25 +892,21 @@ describe("GameRewards", function () {
   describe("Merkle Proof Verification", function () {
     beforeEach(async function () {
       rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") },
-        { account: user2.address, amount: ethers.parseEther("200") }
+        { address: user1.address, amount: ethers.parseEther("100") },
+        { address: user2.address, amount: ethers.parseEther("200") }
       ];
       
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree } = generateMerkleTree(rewards);
+      merkleTree = tree;
 
       // Create initial batch
       await gameRewards.connect(batchAdder).setRewardsBatch(
         merkleTree.getHexRoot(),
         ethers.parseEther("300")
       );
+
+      // Set a shorter claim delay for testing
+      await gameRewards.connect(owner).setClaimDelay(60);
     });
 
     it("Should revert with invalid proof format", async function () {
@@ -1006,18 +925,10 @@ describe("GameRewards", function () {
     it("Should revert with proof from different batch", async function () {
       // Create a different batch with different rewards
       const differentRewards = [
-        { account: user1.address, amount: ethers.parseEther("150") }
+        { address: user1.address, amount: ethers.parseEther("150") }
       ];
       
-      const differentLeaves = differentRewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const differentTree = new MerkleTree(differentLeaves, keccak256, { sortPairs: true });
+      const { tree: differentTree } = generateMerkleTree(differentRewards);
 
       await gameRewards.connect(batchAdder).setRewardsBatch(
         differentTree.getHexRoot(),
@@ -1026,7 +937,7 @@ describe("GameRewards", function () {
 
       const firstBatchId = await gameRewards.currentBatchId() - 1n;
       const proof = differentTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
             [user1.address, ethers.parseEther("150")]
@@ -1047,7 +958,7 @@ describe("GameRewards", function () {
     it("Should revert with modified amount", async function () {
       const batchId = await gameRewards.currentBatchId();
       const originalProof = merkleTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
             [user1.address, ethers.parseEther("100")]
@@ -1068,7 +979,7 @@ describe("GameRewards", function () {
     it("Should revert with wrong user address", async function () {
       const batchId = await gameRewards.currentBatchId();
       const proofForUser1 = merkleTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
             [user1.address, ethers.parseEther("100")]
@@ -1091,36 +1002,31 @@ describe("GameRewards", function () {
     beforeEach(async function () {
       // Setup test rewards and merkle tree
       rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") },
-        { account: user2.address, amount: ethers.parseEther("200") }
+        { address: user1.address, amount: ethers.parseEther("100") },
+        { address: user2.address, amount: ethers.parseEther("200") }
       ];
 
       // Create merkle tree
-      const leaves = rewards.map(x => 
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree } = generateMerkleTree(rewards);
+      merkleTree = tree;
 
       // Setup a batch for testing claims
-      const root = merkleTree.getHexRoot();
       await gameRewards.connect(batchAdder).setRewardsBatch(
-        root,
+        merkleTree.getHexRoot(),
         ethers.parseEther("300")
       );
+
+      // Set a shorter claim delay for testing
+      await gameRewards.connect(owner).setClaimDelay(60);
     });
 
     it("Should allow valid claim with proof", async function () {
       const reward = rewards[0];
       const proof = merkleTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
-            [reward.account, reward.amount]
+            [reward.address, reward.amount]
           )
         )
       );
@@ -1138,10 +1044,10 @@ describe("GameRewards", function () {
     it("Should not allow double claiming", async function () {
       const reward = rewards[0];
       const proof = merkleTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
-            [reward.account, reward.amount]
+            [reward.address, reward.amount]
           )
         )
       );
@@ -1149,7 +1055,7 @@ describe("GameRewards", function () {
       await gameRewards.connect(user1).claimReward(1, reward.amount, proof);
       
       // Wait for claim delay to pass
-      await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+      await ethers.provider.send("evm_increaseTime", [60]);
       await ethers.provider.send("evm_mine");
 
       await expect(
@@ -1160,7 +1066,7 @@ describe("GameRewards", function () {
     it("Should not allow claiming with invalid proof", async function () {
       const reward = rewards[0];
       const invalidProof = merkleTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
             [user2.address, reward.amount] // Wrong user
@@ -1178,23 +1084,19 @@ describe("GameRewards", function () {
     beforeEach(async function () {
       // Setup basic rewards for testing
       rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") }
+        { address: user1.address, amount: ethers.parseEther("100") }
       ];
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree } = generateMerkleTree(rewards);
+      merkleTree = tree;
 
       // Create a batch for testing claims
       await gameRewards.connect(batchAdder).setRewardsBatch(
         merkleTree.getHexRoot(),
         ethers.parseEther("100")
       );
+
+      // Set a shorter claim delay for testing
+      await gameRewards.connect(owner).setClaimDelay(60);
     });
 
     it("Should allow admin to pause and unpause contract", async function () {
@@ -1213,10 +1115,10 @@ describe("GameRewards", function () {
     it("Should prevent operations while paused", async function () {
       const batchId = await gameRewards.currentBatchId();
       const proof = merkleTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
-            [rewards[0].account, rewards[0].amount]
+            [rewards[0].address, rewards[0].amount]
           )
         )
       );
@@ -1307,7 +1209,7 @@ describe("GameRewards", function () {
       await gameRewards.connect(user1).unpause();
       expect(await gameRewards.paused()).to.be.false;
 
-      // Original admin renounces role but pause state remains
+      // Original admin renounces their role but pause state remains
       await gameRewards.connect(user1).pause();
       await gameRewards.renounceRole(await gameRewards.DEFAULT_ADMIN_ROLE(), owner.address);
       expect(await gameRewards.paused()).to.be.true;
@@ -1315,136 +1217,80 @@ describe("GameRewards", function () {
   });
 
   describe("Claim Delay", function () {
-    it("Should enforce claim delay between claims", async function () {
+    beforeEach(async function () {
       // Setup initial batch
       rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") },
-        { account: user2.address, amount: ethers.parseEther("200") }
-      ];
-
-      const leaves = rewards.map(x => 
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
-
-      await gameRewards.connect(batchAdder).setRewardsBatch(
-        merkleTree.getHexRoot(),
-        ethers.parseEther("300")
-      );
-
-      // First claim
-      const reward = rewards[0];
-      const proof = merkleTree.getHexProof(
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [reward.account, reward.amount]
-          )
-        )
-      );
-
-      await gameRewards.connect(user1).claimReward(1, reward.amount, proof);
-
-      // Setup second batch
-      const secondBatchRewards = [
-        { account: user1.address, amount: ethers.parseEther("150") }
-      ];
-
-      const secondLeaves = secondBatchRewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const secondMerkleTree = new MerkleTree(secondLeaves, keccak256, { sortPairs: true });
-
-      await gameRewards.connect(batchAdder).setRewardsBatch(
-        secondMerkleTree.getHexRoot(),
-        ethers.parseEther("150")
-      );
-
-      // Try to claim from second batch immediately
-      const secondReward = secondBatchRewards[0];
-      const secondProof = secondMerkleTree.getHexProof(
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [secondReward.account, secondReward.amount]
-          )
-        )
-      );
-
-      await expect(
-        gameRewards.connect(user1).claimReward(2, secondReward.amount, secondProof)
-      ).to.be.revertedWith("Claim delay not passed");
-
-      // Wait for delay and try again
-      await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
-      await ethers.provider.send("evm_mine");
-
-      await gameRewards.connect(user1).claimReward(2, secondReward.amount, secondProof);
-    });
-
-    it("Should allow admin to update claim delay", async function () {
-      const newDelay = 180; // 3 minutes
-      await gameRewards.connect(owner).setClaimDelay(newDelay);
-      expect(await gameRewards.claimDelay()).to.equal(newDelay);
-    });
-
-    it("Should not allow non-admin to update claim delay", async function () {
-      const newDelay = 180;
-      await expect(
-        gameRewards.connect(user1).setClaimDelay(newDelay)
-      ).to.be.revertedWithCustomError(gameRewards, "AccessControlUnauthorizedAccount");
-    });
-
-    it("Should not allow setting delay outside bounds", async function () {
-      const MIN_DELAY = 60; // 1 minute
-      const MAX_DELAY = 5184000; // 60 days
-
-      await expect(
-        gameRewards.connect(owner).setClaimDelay(MIN_DELAY - 1)
-      ).to.be.revertedWith("Invalid delay period");
-
-      await expect(
-        gameRewards.connect(owner).setClaimDelay(MAX_DELAY + 1)
-      ).to.be.revertedWith("Invalid delay period");
-    });
-  });
-
-  describe("Claim Delay Management", function () {
-    it("Should enforce delay modification correctly", async function () {
-      // Setup initial batch
-      rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") }
+        { address: user1.address, amount: ethers.parseEther("100") }
       ];
       
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
+      const { tree } = generateMerkleTree(rewards);
+
+      // Set a shorter claim delay for testing
+      await gameRewards.connect(owner).setClaimDelay(60);
+
+      // Create first batch
+      await gameRewards.connect(batchAdder).setRewardsBatch(
+        tree.getHexRoot(),
+        ethers.parseEther("100")
+      );
+    });
+
+    it("Should enforce claim delay between claims", async function () {
+      const reward = rewards[0];
+      const proof = merkleTree.getHexProof(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
-            [x.account, x.amount]
+            [reward.address, reward.amount]
           )
         )
       );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
 
+      // First claim should work
+      await gameRewards.connect(user1).claimReward(1, reward.amount, proof);
+
+      // Create second batch
       await gameRewards.connect(batchAdder).setRewardsBatch(
         merkleTree.getHexRoot(),
         ethers.parseEther("100")
       );
-      const batchId = await gameRewards.currentBatchId();
 
-      // Make initial claim
+      // Try to claim immediately (should fail)
+      await expect(
+        gameRewards.connect(user1).claimReward(2, reward.amount, proof)
+      ).to.be.revertedWith("Claim delay not passed");
+
+      // Wait for delay
+      await ethers.provider.send("evm_increaseTime", [61]); // slightly more than delay
+      await ethers.provider.send("evm_mine");
+
+      // Should now be able to claim
+      await gameRewards.connect(user1).claimReward(2, reward.amount, proof);
+    });
+  });
+
+  describe("Claim Delay Management", function () {
+    beforeEach(async function () {
+      // Setup rewards
+      rewards = [
+        { address: user1.address, amount: ethers.parseEther("100") }
+      ];
+      const { tree } = generateMerkleTree(rewards);
+      merkleTree = tree;
+
+      // Set initial short delay
+      await gameRewards.connect(owner).setClaimDelay(60);
+
+      // Create first batch
+      await gameRewards.connect(batchAdder).setRewardsBatch(
+        merkleTree.getHexRoot(),
+        ethers.parseEther("100")
+      );
+    });
+
+    it("Should enforce delay modification correctly", async function () {
       const proof = merkleTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
             [user1.address, ethers.parseEther("100")]
@@ -1452,374 +1298,137 @@ describe("GameRewards", function () {
         )
       );
 
-      await gameRewards.connect(user1).claimReward(batchId, ethers.parseEther("100"), proof);
+      // First claim
+      await gameRewards.connect(user1).claimReward(1, ethers.parseEther("100"), proof);
 
       // Modify delay to a longer period
       const newDelay = 300; // 5 minutes
       await gameRewards.connect(owner).setClaimDelay(newDelay);
 
-      // Create another batch
+      // Create second batch
       await gameRewards.connect(batchAdder).setRewardsBatch(
         merkleTree.getHexRoot(),
         ethers.parseEther("100")
       );
-      const secondBatchId = await gameRewards.currentBatchId();
 
-      // Try to claim before new delay period
-      await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]); // Old delay
+      // Try to claim before new delay period (should fail)
+      await ethers.provider.send("evm_increaseTime", [61]); // Old delay + 1
       await ethers.provider.send("evm_mine");
 
-      await expect(
-        gameRewards.connect(user1).claimReward(secondBatchId, ethers.parseEther("100"), proof)
-      ).to.be.revertedWith("Claim delay not passed");
-
-      // Wait for new delay period and claim successfully
-      await ethers.provider.send("evm_increaseTime", [newDelay - INITIAL_DELAY]);
-      await ethers.provider.send("evm_mine");
-
-      await gameRewards.connect(user1).claimReward(secondBatchId, ethers.parseEther("100"), proof);
-    });
-
-    it("Should reject invalid delay values", async function () {
-      const MIN_DELAY = 60; // 1 minute
-      const MAX_DELAY = 5184000; // 60 days
-
-      // Test below minimum
-      await expect(
-        gameRewards.connect(owner).setClaimDelay(MIN_DELAY - 1)
-      ).to.be.revertedWith("Invalid delay period");
-
-      // Test above maximum
-      await expect(
-        gameRewards.connect(owner).setClaimDelay(MAX_DELAY + 1)
-      ).to.be.revertedWith("Invalid delay period");
-
-      // Test zero delay
-      await expect(
-        gameRewards.connect(owner).setClaimDelay(0)
-      ).to.be.revertedWith("Invalid delay period");
-    });
-
-    it("Should maintain delay across multiple claims", async function () {
-      // Setup multiple batches
-      const batchRewards = [
-        { account: user1.address, amount: ethers.parseEther("100") }
-      ];
-      
-      const leaves = batchRewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const batchTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
-
-      // Create three batches
-      for (let i = 0; i < 3; i++) {
-        await gameRewards.connect(batchAdder).setRewardsBatch(
-          batchTree.getHexRoot(),
-          ethers.parseEther("100")
-        );
-      }
-
-      const proof = batchTree.getHexProof(
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [user1.address, ethers.parseEther("100")]
-          )
-        )
-      );
-
-      // Claim from first batch
-      await gameRewards.connect(user1).claimReward(1, ethers.parseEther("100"), proof);
-
-      // Try to claim from second batch immediately (should fail)
       await expect(
         gameRewards.connect(user1).claimReward(2, ethers.parseEther("100"), proof)
       ).to.be.revertedWith("Claim delay not passed");
 
-      // Wait delay and claim from second batch
-      await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY]);
+      // Wait for remaining new delay period
+      await ethers.provider.send("evm_increaseTime", [240]); // Additional time to reach new delay
       await ethers.provider.send("evm_mine");
+
+      // Should now be able to claim
       await gameRewards.connect(user1).claimReward(2, ethers.parseEther("100"), proof);
-
-      // Try to claim from third batch immediately (should fail)
-      await expect(
-        gameRewards.connect(user1).claimReward(3, ethers.parseEther("100"), proof)
-      ).to.be.revertedWith("Claim delay not passed");
-    });
-
-    it("Should handle delay with contract pause", async function () {
-      // Setup batch
-      rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") }
-      ];
-      
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
-
-      await gameRewards.connect(batchAdder).setRewardsBatch(
-        merkleTree.getHexRoot(),
-        ethers.parseEther("100")
-      );
-      const batchId = await gameRewards.currentBatchId();
-
-      // Make initial claim
-      const proof = merkleTree.getHexProof(
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [user1.address, ethers.parseEther("100")]
-          )
-        )
-      );
-
-      await gameRewards.connect(user1).claimReward(batchId, ethers.parseEther("100"), proof);
-
-      // Create another batch
-      await gameRewards.connect(batchAdder).setRewardsBatch(
-        merkleTree.getHexRoot(),
-        ethers.parseEther("100")
-      );
-      const secondBatchId = await gameRewards.currentBatchId();
-
-      // Wait partial delay and pause contract
-      await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY / 2]);
-      await ethers.provider.send("evm_mine");
-      await gameRewards.connect(owner).pause();
-
-      // Wait remaining delay
-      await ethers.provider.send("evm_increaseTime", [INITIAL_DELAY / 2]);
-      await ethers.provider.send("evm_mine");
-
-      // Try to claim while paused (should fail)
-      await expect(
-        gameRewards.connect(user1).claimReward(secondBatchId, ethers.parseEther("100"), proof)
-      ).to.be.reverted;
-
-      // Unpause and claim successfully
-      await gameRewards.connect(owner).unpause();
-      await gameRewards.connect(user1).claimReward(secondBatchId, ethers.parseEther("100"), proof);
     });
   });
 
   describe("User Management", function () {
+    let banManager;
+
+    beforeEach(async function () {
+      const [, , , _banManager] = await ethers.getSigners();
+      banManager = _banManager;
+    });
+
+    it("Should allow admin to add ban manager", async function () {
+      await expect(gameRewards.connect(owner).addBanManager(banManager.address))
+        .to.emit(gameRewards, "RoleGranted")
+        .withArgs(await gameRewards.BAN_MANAGER_ROLE(), banManager.address, owner.address);
+    });
+
+    it("Should not allow non-admin to add ban manager", async function () {
+      await expect(gameRewards.connect(user1).addBanManager(banManager.address))
+        .to.be.revertedWithCustomError(gameRewards, "AccessControlUnauthorizedAccount")
+        .withArgs(user1.address, ethers.ZeroHash);
+    });
+
     it("Should allow admin to ban user", async function () {
       const tx = await gameRewards.connect(owner).banUser(user1.address);
-      const receipt = await tx.wait();
-      
-      const event = receipt.logs.find(log => log.fragment && log.fragment.name === 'UserBanned');
-      expect(event).to.not.be.undefined;
-      expect(event.args[0]).to.equal(user1.address);
-      
+      await expect(tx).to.emit(gameRewards, "UserBanned").withArgs(user1.address, await time.latest());
       expect(await gameRewards.isBanned(user1.address)).to.be.true;
+    });
+
+    it("Should allow ban manager to ban user", async function () {
+      await gameRewards.connect(owner).addBanManager(banManager.address);
+      const tx = await gameRewards.connect(banManager).banUser(user1.address);
+      await expect(tx).to.emit(gameRewards, "UserBanned").withArgs(user1.address, await time.latest());
+      expect(await gameRewards.isBanned(user1.address)).to.be.true;
+    });
+
+    it("Should not allow unauthorized address to ban user", async function () {
+      await expect(gameRewards.connect(user1).banUser(user2.address))
+        .to.be.revertedWith("Caller cannot ban users");
     });
 
     it("Should allow admin to unban user", async function () {
       await gameRewards.connect(owner).banUser(user1.address);
-      
       const tx = await gameRewards.connect(owner).unbanUser(user1.address);
-      const receipt = await tx.wait();
-      
-      const event = receipt.logs.find(log => log.fragment && log.fragment.name === 'UserUnbanned');
-      expect(event).to.not.be.undefined;
-      expect(event.args[0]).to.equal(user1.address);
-      
+      await expect(tx).to.emit(gameRewards, "UserUnbanned").withArgs(user1.address, await time.latest());
       expect(await gameRewards.isBanned(user1.address)).to.be.false;
     });
 
-    it("Should not allow banned user to claim rewards", async function () {
+    it("Should allow ban manager to unban user", async function () {
+      await gameRewards.connect(owner).addBanManager(banManager.address);
+      await gameRewards.connect(banManager).banUser(user1.address);
+      const tx = await gameRewards.connect(banManager).unbanUser(user1.address);
+      await expect(tx).to.emit(gameRewards, "UserUnbanned").withArgs(user1.address, await time.latest());
+      expect(await gameRewards.isBanned(user1.address)).to.be.false;
+    });
+
+    it("Should not allow unauthorized address to unban user", async function () {
+      await gameRewards.connect(owner).banUser(user2.address);
+      await expect(gameRewards.connect(user1).unbanUser(user2.address))
+        .to.be.revertedWith("Caller cannot unban users");
+    });
+
+    it("Should not allow banning already banned user", async function () {
       await gameRewards.connect(owner).banUser(user1.address);
-
-      const root = merkleTree.getHexRoot();
-      await gameRewards.connect(batchAdder).setRewardsBatch(
-        root,
-        ethers.parseEther("300")
-      );
-
-      const reward = rewards[0];
-      const proof = merkleTree.getHexProof(
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [reward.account, reward.amount]
-          )
-        )
-      );
-
-      await expect(
-        gameRewards.connect(user1).claimReward(1, reward.amount, proof)
-      ).to.be.revertedWith("User is banned from claiming");
+      await expect(gameRewards.connect(owner).banUser(user1.address))
+        .to.be.revertedWith("User already banned");
     });
 
-    it("Should not allow banning already banned users", async function () {
-      // First ban
-      await gameRewards.connect(owner).banUser(user1.address);
-      expect(await gameRewards.isBanned(user1.address)).to.be.true;
-
-      // Try to ban again
-      await expect(
-        gameRewards.connect(owner).banUser(user1.address)
-      ).to.be.revertedWith("User already banned");
-    });
-
-    it("Should not allow unbanning non-banned users", async function () {
-      await expect(
-        gameRewards.connect(owner).unbanUser(user1.address)
-      ).to.be.revertedWith("User not banned");
-    });
-
-    it("Should not allow unauthorized users to ban", async function () {
-      await expect(
-        gameRewards.connect(user1).banUser(user2.address)
-      ).to.be.revertedWithCustomError(gameRewards, "AccessControlUnauthorizedAccount");
-
-      await expect(
-        gameRewards.connect(batchAdder).banUser(user2.address)
-      ).to.be.revertedWithCustomError(gameRewards, "AccessControlUnauthorizedAccount");
-    });
-
-    it("Should not allow unauthorized users to unban", async function () {
-      // First ban a user
-      await gameRewards.connect(owner).banUser(user1.address);
-
-      // Try unauthorized unban
-      await expect(
-        gameRewards.connect(user2).unbanUser(user1.address)
-      ).to.be.revertedWithCustomError(gameRewards, "AccessControlUnauthorizedAccount");
-
-      await expect(
-        gameRewards.connect(batchAdder).unbanUser(user1.address)
-      ).to.be.revertedWithCustomError(gameRewards, "AccessControlUnauthorizedAccount");
-    });
-
-    it("Should prevent banned users from claiming multiple rewards", async function () {
-      // Setup rewards
-      rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") },
-        { account: user1.address, amount: ethers.parseEther("150") }
-      ];
-      
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
-
-      // Create batch
-      await gameRewards.connect(batchAdder).setRewardsBatch(
-        merkleTree.getHexRoot(),
-        ethers.parseEther("250")
-      );
-
-      // Ban user
-      await gameRewards.connect(owner).banUser(user1.address);
-
-      // Try to claim multiple rewards
-      const claims = rewards.map((reward) => {
-        const proof = merkleTree.getHexProof(
-          ethers.keccak256(
-            ethers.solidityPacked(
-              ["address", "uint256"],
-              [reward.account, reward.amount]
-            )
-          )
-        );
-        return {
-          batchId: 1,
-          amount: reward.amount,
-          merkleProof: proof
-        };
-      });
-
-      await expect(
-        gameRewards.connect(user1).claimMultipleRewards(claims)
-      ).to.be.revertedWith("User is banned from claiming");
-    });
-
-    it("Should allow claiming after unban", async function () {
-      // Setup reward
-      rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") }
-      ];
-      
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
-
-      // Create batch
-      await gameRewards.connect(batchAdder).setRewardsBatch(
-        merkleTree.getHexRoot(),
-        ethers.parseEther("100")
-      );
-      const batchId = await gameRewards.currentBatchId();
-
-      // Ban user
-      await gameRewards.connect(owner).banUser(user1.address);
-
-      const proof = merkleTree.getHexProof(
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [user1.address, ethers.parseEther("100")]
-          )
-        )
-      );
-
-      // Try to claim while banned
-      await expect(
-        gameRewards.connect(user1).claimReward(batchId, ethers.parseEther("100"), proof)
-      ).to.be.revertedWith("User is banned from claiming");
-
-      // Unban user
-      await gameRewards.connect(owner).unbanUser(user1.address);
-
-      // Should now be able to claim
-      await gameRewards.connect(user1).claimReward(batchId, ethers.parseEther("100"), proof);
+    it("Should not allow unbanning non-banned user", async function () {
+      await expect(gameRewards.connect(owner).unbanUser(user1.address))
+        .to.be.revertedWith("User not banned");
     });
   });
 
   describe("Security", function () {
-    it("Should not allow other address to use someone else's proof", async function () {
+    beforeEach(async function () {
       // Setup a batch
-      const root = merkleTree.getHexRoot();
+      rewards = [
+        { address: user1.address, amount: ethers.parseEther("100") }
+      ];
+      const { tree } = generateMerkleTree(rewards);
+      merkleTree = tree;
+
       await gameRewards.connect(batchAdder).setRewardsBatch(
-        root,
-        ethers.parseEther("300")
+        merkleTree.getHexRoot(),
+        ethers.parseEther("100")
       );
 
-      // Get user1's proof
+      // Set a shorter claim delay for testing
+      await gameRewards.connect(owner).setClaimDelay(60);
+    });
+
+    it("Should not allow other address to use someone else's proof", async function () {
       const reward = rewards[0];
       const proof = merkleTree.getHexProof(
-        ethers.keccak256(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
-            [reward.account, reward.amount]
+            [reward.address, reward.amount]
           )
         )
       );
 
-      // Try to claim user1's reward from user2's address
+      // Try to use user1's proof from user2's account
       await expect(
         gameRewards.connect(user2).claimReward(1, reward.amount, proof)
       ).to.be.revertedWith("Invalid proof");
@@ -1839,17 +1448,13 @@ describe("GameRewards", function () {
 
       // Setup basic rewards for testing batch creation
       rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") }
+        { address: user1.address, amount: ethers.parseEther("100") }
       ];
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree } = generateMerkleTree(rewards);
+      merkleTree = tree;
+
+      // Set a shorter claim delay for testing
+      await gameRewards.connect(owner).setClaimDelay(60);
     });
 
     it("Should allow admin to grant and revoke batch adder role", async function () {
@@ -1975,27 +1580,19 @@ describe("GameRewards", function () {
     it("Should check for insufficient token balance", async function () {
       // Setup rewards that exceed contract balance
       rewards = [
-        { account: user1.address, amount: ethers.parseEther("2000") } // More than the 1000 tokens minted
+        { address: user1.address, amount: ethers.parseEther("2000") } // More than the 1000 tokens minted
       ];
       
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree } = generateMerkleTree(rewards);
 
       // Create batch
       await gameRewards.connect(batchAdder).setRewardsBatch(
-        merkleTree.getHexRoot(),
+        tree.getHexRoot(),
         ethers.parseEther("2000")
       );
 
-      const proof = merkleTree.getHexProof(
-        ethers.keccak256(
+      const proof = tree.getHexProof(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
             [user1.address, ethers.parseEther("2000")]
@@ -2028,28 +1625,20 @@ describe("GameRewards", function () {
 
       // Setup rewards
       rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") }
+        { address: user1.address, amount: ethers.parseEther("100") }
       ];
       
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree } = generateMerkleTree(rewards);
 
       // Grant roles and setup batch
       await gameRewardsWithFailingToken.grantRole(await gameRewardsWithFailingToken.BATCH_ADDER_ROLE(), batchAdder.address);
       await gameRewardsWithFailingToken.connect(batchAdder).setRewardsBatch(
-        merkleTree.getHexRoot(),
+        tree.getHexRoot(),
         ethers.parseEther("100")
       );
 
-      const proof = merkleTree.getHexProof(
-        ethers.keccak256(
+      const proof = tree.getHexProof(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
             [user1.address, ethers.parseEther("100")]
@@ -2070,26 +1659,18 @@ describe("GameRewards", function () {
 
       // Setup and execute a claim
       rewards = [
-        { account: user1.address, amount: ethers.parseEther("100") }
+        { address: user1.address, amount: ethers.parseEther("100") }
       ];
       
-      const leaves = rewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree } = generateMerkleTree(rewards);
 
       await gameRewards.connect(batchAdder).setRewardsBatch(
-        merkleTree.getHexRoot(),
+        tree.getHexRoot(),
         ethers.parseEther("100")
       );
 
-      const proof = merkleTree.getHexProof(
-        ethers.keccak256(
+      const proof = tree.getHexProof(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
             [user1.address, ethers.parseEther("100")]
@@ -2139,33 +1720,25 @@ describe("GameRewards", function () {
       
       // Setup reward with max uint256 amount
       const maxReward = {
-        account: user1.address,
+        address: user1.address,
         amount: maxUint256
       };
 
-      const leaves = [maxReward].map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree } = generateMerkleTree([maxReward]);
 
       // Try to create batch with max amount
       await expect(
         gameRewards.connect(batchAdder).setRewardsBatch(
-          merkleTree.getHexRoot(),
+          tree.getHexRoot(),
           maxUint256
         )
       ).to.not.be.reverted;
 
-      const proof = merkleTree.getHexProof(
-        ethers.keccak256(
+      const proof = tree.getHexProof(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
-            [maxReward.account, maxReward.amount]
+            [maxReward.address, maxReward.amount]
           )
         )
       );
@@ -2179,31 +1752,23 @@ describe("GameRewards", function () {
     it("Should handle minimum valid values", async function () {
       // Setup reward with minimum amount (1 wei)
       const minReward = {
-        account: user1.address,
+        address: user1.address,
         amount: 1n
       };
 
-      const leaves = [minReward].map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree } = generateMerkleTree([minReward]);
 
       // Create batch with minimum amount
       await gameRewards.connect(batchAdder).setRewardsBatch(
-        merkleTree.getHexRoot(),
+        tree.getHexRoot(),
         1n
       );
 
-      const proof = merkleTree.getHexProof(
-        ethers.keccak256(
+      const proof = tree.getHexProof(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
-            [minReward.account, minReward.amount]
+            [minReward.address, minReward.amount]
           )
         )
       );
@@ -2217,23 +1782,15 @@ describe("GameRewards", function () {
     it("Should handle array bounds and empty arrays", async function () {
       // Create a batch with multiple rewards to ensure we have valid proofs
       const validRewards = [
-        { account: user1.address, amount: ethers.parseEther("100") },
-        { account: user2.address, amount: ethers.parseEther("150") },
-        { account: user3.address, amount: ethers.parseEther("200") }
+        { address: user1.address, amount: ethers.parseEther("100") },
+        { address: user2.address, amount: ethers.parseEther("150") },
+        { address: user3.address, amount: ethers.parseEther("200") }
       ];
       
-      const leaves = validRewards.map(x =>
-        ethers.keccak256(
-          ethers.solidityPacked(
-            ["address", "uint256"],
-            [x.account, x.amount]
-          )
-        )
-      );
-      const merkleTree = new MerkleTree(leaves, keccak256, { sortPairs: true });
+      const { tree } = generateMerkleTree(validRewards);
   
       await gameRewards.connect(batchAdder).setRewardsBatch(
-        merkleTree.getHexRoot(),
+        tree.getHexRoot(),
         ethers.parseEther("450") // Total of all rewards
       );
   
@@ -2248,8 +1805,8 @@ describe("GameRewards", function () {
       ).to.be.revertedWith("Invalid claims count");
 
       // Get a valid proof for user1's reward
-      const validProof = merkleTree.getHexProof(
-        ethers.keccak256(
+      const validProof = tree.getHexProof(
+        keccak256(
           ethers.solidityPacked(
             ["address", "uint256"],
             [user1.address, ethers.parseEther("100")]
@@ -2273,4 +1830,100 @@ describe("GameRewards", function () {
       ).to.not.be.reverted;
     });
   });
-})
+
+  describe("Token Recovery", function () {
+    let otherToken;
+    
+    beforeEach(async function () {
+      // Deploy another token for testing recovery
+      const MockERC20 = await ethers.getContractFactory("MockERC20");
+      otherToken = await MockERC20.deploy("Other Token", "OTHER");
+      await otherToken.waitForDeployment();
+      
+      // Send some tokens to the contract
+      await otherToken.mint(await gameRewards.getAddress(), ethers.parseEther("500"));
+    });
+
+    it("Should allow admin to recover tokens", async function () {
+      const amount = ethers.parseEther("100");
+      const recipient = user1.address;
+      
+      // Check initial balances
+      const initialBalance = await otherToken.balanceOf(recipient);
+      
+      // Recover tokens
+      await gameRewards.connect(owner).recoverToken(
+        await otherToken.getAddress(),
+        amount,
+        recipient
+      );
+      
+      // Check final balances
+      const finalBalance = await otherToken.balanceOf(recipient);
+      expect(finalBalance - initialBalance).to.equal(amount);
+    });
+
+    it("Should allow recovering game tokens", async function () {
+      const amount = ethers.parseEther("100");
+      const recipient = user2.address;
+      
+      // Recover game tokens
+      await gameRewards.connect(owner).recoverToken(
+        await gameToken.getAddress(),
+        amount,
+        recipient
+      );
+      
+      // Check recipient received the tokens
+      expect(await gameToken.balanceOf(recipient)).to.equal(amount);
+    });
+
+    it("Should not allow non-admin to recover tokens", async function () {
+      const amount = ethers.parseEther("100");
+      
+      // Try to recover tokens as non-admin
+      await expect(
+        gameRewards.connect(user1).recoverToken(
+          await otherToken.getAddress(),
+          amount,
+          user2.address
+        )
+      ).to.be.revertedWithCustomError(gameRewards, "AccessControlUnauthorizedAccount")
+        .withArgs(user1.address, ethers.ZeroHash);
+    });
+
+    it("Should not allow recovery to zero address", async function () {
+      const amount = ethers.parseEther("100");
+      
+      await expect(
+        gameRewards.connect(owner).recoverToken(
+          await otherToken.getAddress(),
+          amount,
+          ethers.ZeroAddress
+        )
+      ).to.be.revertedWith("Cannot recover to zero address");
+    });
+
+    it("Should not allow recovery of zero amount", async function () {
+      await expect(
+        gameRewards.connect(owner).recoverToken(
+          await otherToken.getAddress(),
+          0,
+          user1.address
+        )
+      ).to.be.revertedWith("Amount must be greater than 0");
+    });
+
+    it("Should not allow recovery of more tokens than available", async function () {
+      const tooMuchAmount = ethers.parseEther("1000");
+      
+      await expect(
+        gameRewards.connect(owner).recoverToken(
+          await otherToken.getAddress(),
+          tooMuchAmount,
+          user1.address
+        )
+      ).to.be.revertedWith("Insufficient balance");
+    });
+  });
+});

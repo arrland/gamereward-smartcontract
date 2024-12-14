@@ -16,6 +16,7 @@ contract GameRewards is AccessControl, ReentrancyGuard, Pausable {
     // ============ Role Definitions ============
     
     bytes32 public constant BATCH_ADDER_ROLE = keccak256("BATCH_ADDER_ROLE");
+    bytes32 public constant BAN_MANAGER_ROLE = keccak256("BAN_MANAGER_ROLE");
     
     // ============ State Variables ============
 
@@ -44,7 +45,7 @@ contract GameRewards is AccessControl, ReentrancyGuard, Pausable {
     uint256 public constant MIN_DELAY = 60; // 1 minute
     uint256 public constant MAX_DELAY = 5184000; // 60 days
     uint256 public constant MAX_CLAIMS_PER_TX = 50;
-    uint256 public constant INITIAL_DELAY = 120; // 2 minutes
+    uint256 public constant INITIAL_DELAY = 60*60*24*14; // 14 days
     
     // Time delay between claims
     uint256 public claimDelay;
@@ -143,7 +144,17 @@ contract GameRewards is AccessControl, ReentrancyGuard, Pausable {
         grantRole(BATCH_ADDER_ROLE, _batchAdder);
     }
 
-    function banUser(address user) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function addBanManager(address _banManager) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(_banManager != address(0), "Invalid ban manager address");
+        grantRole(BAN_MANAGER_ROLE, _banManager);
+    }
+
+    function banUser(address user) external {
+        require(
+            hasRole(DEFAULT_ADMIN_ROLE, msg.sender) || 
+            hasRole(BAN_MANAGER_ROLE, msg.sender), 
+            "Caller cannot ban users"
+        );
         require(user != address(0), "Invalid address");
         require(!isBanned[user], "User already banned");
         
@@ -151,7 +162,12 @@ contract GameRewards is AccessControl, ReentrancyGuard, Pausable {
         emit UserBanned(user, block.timestamp);
     }
 
-    function unbanUser(address user) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function unbanUser(address user) external {
+        require(
+            hasRole(DEFAULT_ADMIN_ROLE, msg.sender) || 
+            hasRole(BAN_MANAGER_ROLE, msg.sender), 
+            "Caller cannot unban users"
+        );
         require(user != address(0), "Invalid address");
         require(isBanned[user], "User not banned");
         
@@ -182,6 +198,26 @@ contract GameRewards is AccessControl, ReentrancyGuard, Pausable {
      */
     function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _unpause();
+    }
+
+    /**
+     * @notice Allows admin to recover any ERC20 tokens sent to the contract
+     * @param tokenAddress The address of the token to recover
+     * @param amount The amount of tokens to recover
+     * @param recipient The address to send the recovered tokens to
+     */
+    function recoverToken(
+        address tokenAddress,
+        uint256 amount,
+        address recipient
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(recipient != address(0), "Cannot recover to zero address");
+        require(amount > 0, "Amount must be greater than 0");
+        
+        IERC20 token = IERC20(tokenAddress);
+        require(token.balanceOf(address(this)) >= amount, "Insufficient balance");
+        
+        require(token.transfer(recipient, amount), "Transfer failed");
     }
 
     // ============ User Functions ============
